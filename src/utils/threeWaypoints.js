@@ -13,7 +13,8 @@ import * as THREE from "three";
 
 const MAX_POINTS = 2000;
 const TAIL_COLOR = [0.29, 0.06, 1.0];  // #4a10ff — oldest end of the trail
-const HEAD_COLOR = [1.0, 0.42, 0.95];  // near-white pink — current end, at the drone
+const HEAD_COLOR = [1.0, 0.184, 0.816]; // #ff2fd0 — saturated pink at the current end, not washed-out white
+const TAIL_GAP_M = 1.2; // small real-world gap between the ribbon's tip and the drone itself
 
 function buildRibbon(opacity, additive, renderOrder) {
   const geometry = new THREE.BufferGeometry();
@@ -28,7 +29,12 @@ function buildRibbon(opacity, additive, renderOrder) {
     opacity,
     blending: additive ? THREE.AdditiveBlending : THREE.NormalBlending,
     depthWrite: false,
-    depthTest: false,
+    // depthTest must stay ON: this was left off from an earlier ground-ring
+    // design (rings needed to never be occluded by nearby ground clutter),
+    // but now the ribbon's tip sits right next to the drone — with depth
+    // testing disabled it painted straight over the drone model regardless
+    // of which was actually in front.
+    depthTest: true,
     side: THREE.DoubleSide,
   });
   const mesh = new THREE.Mesh(geometry, material);
@@ -51,7 +57,7 @@ export class FlightTrail {
    * @param worldPixelsPerMeter  horizontal meter -> world-pixel scale factor
    * @param glowHalfWidthM / coreHalfWidthM  ribbon half-widths, in meters
    */
-  update(points, toRelative, worldPixelsPerMeter, glowHalfWidthM = 6, coreHalfWidthM = 2.2) {
+  update(points, toRelative, worldPixelsPerMeter, glowHalfWidthM = 1.8, coreHalfWidthM = 0.6) {
     const n = Math.min(points.length, MAX_POINTS);
     if (n < 2) {
       this.glow.geometry.setDrawRange(0, 0);
@@ -65,6 +71,18 @@ export class FlightTrail {
       // Real altitude at each point — this is what makes the ribbon rise
       // through the air to meet the drone instead of sitting on the ground.
       rel[i] = toRelative(p.lat, p.lng, p.alt || 0);
+    }
+
+    // Pull the tip back a small gap so the ribbon trails from just behind
+    // the drone's tail instead of appearing to emerge from its center.
+    if (n >= 2) {
+      const head = rel[n - 1];
+      const prev = rel[n - 2];
+      const dx = head[0] - prev[0], dy = head[1] - prev[1], dz = head[2] - prev[2];
+      const segLen = Math.hypot(dx, dy, dz) || 1;
+      const gap = Math.min(TAIL_GAP_M * worldPixelsPerMeter, segLen * 0.9);
+      const t = 1 - gap / segLen;
+      rel[n - 1] = [prev[0] + dx * t, prev[1] + dy * t, prev[2] + dz * t];
     }
 
     fillRibbon(this.glow, rel, n, glowHalfWidthM * worldPixelsPerMeter);
