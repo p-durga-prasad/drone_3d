@@ -2,40 +2,71 @@ import { useEffect, useRef, useState } from "react";
 import * as maplibregl from "maplibre-gl";
 import * as THREE from "three";
 import { store } from "../store/telemetryStore";
+import { useTelemetrySync } from "../hooks/useTelemetrySync";
 import { classColor } from "../utils/classColors";
 import { buildVehicleModel, buildMarker, buildDroneModel } from "../utils/threeVehicles";
 import { FlightTrail } from "../utils/threeWaypoints";
 
-// ── Constants ────────────────────────────────────────────────────────────────
-const DEFAULT_CENTER  = [78.428228, 17.417393]; // [lng, lat] — MapLibre order
-const DEFAULT_ZOOM    = 16;
-const INITIAL_ZOOM    = 19;   // first camera lock onto the drone zooms in closer than the follow-cam's usual level
-const DEFAULT_PITCH   = 58;   // oblique bird's-eye
-const DEFAULT_BEARING = 20;   // slight rotation for depth
-const OBJECT_HIT_RADIUS_PX = 26; // click-to-select tolerance around a vehicle's projected screen position
-const DRONE_HIT_RADIUS_PX = 30;
-const DRONE_SCALE_BOOST = 1.8; // true 1:1 meter scale reads as a speck at this camera distance
-const DRONE_SMOOTHING = 0.18;  // per-frame lerp factor toward the latest telemetry fix
+/* =========================================================================
+   Port of the reference digital-twin renderer's TPP ("flight following")
+   chase camera + cinematic HUD (mapping/templates/real.html), onto this
+   app's existing live WebSocket -> telemetryStore pipeline. Same camera-
+   solve math and HUD chrome (sky/vignette, top-right counts panel,
+   status/warn badges) — no follow/free-roam toggle and no click popups,
+   because the reference renderer has neither: it's a passive,
+   non-interactive, camera-driven cinematic view.
 
-// MapLibre's `center` always renders at the exact screen center, but that's
-// the GROUND point (altitude 0) — the drone itself sits `alt` meters above
-// it, and with the map pitched, an elevated point projects higher up the
-// screen than its ground point does, so centering on the drone's raw
-// lat/lng leaves it looking off-center (too high). Compensating: push the
-// look-at point forward (in the direction the camera is already facing,
-// i.e. the drone's heading, since bearing is locked to heading below) by
-// the ground distance an object at this altitude and pitch appears to
-// parallax — `alt * tan(pitch)` — so the drone's actual elevated position
-// lands back on the true center of the screen.
-function droneCameraCenter(lat, lng, alt, headingDeg) {
-  const forwardM = Math.max(0, alt) * Math.tan((DEFAULT_PITCH * Math.PI) / 180);
-  const headingRad = (headingDeg * Math.PI) / 180;
-  const dLat = (forwardM * Math.cos(headingRad)) / 111320;
-  const dLng = (forwardM * Math.sin(headingRad)) / (111320 * Math.cos((lat * Math.PI) / 180));
-  return [lng + dLng, lat + dLat];
+   TUNE below deliberately does NOT match real.html's literal numbers.
+   real.html's screen-space-derived camera solve is altitude-invariant, but
+   its distance floor is set by the OSM raster tile ceiling (z19) and the
+   viewport's FOV — at real.html's own pitchDeg=72/droneScreenY=0.28/
+   groundScreenY=0.72 defaults, the solved camera sits ~200m from a drone
+   flying at 60m AGL (measured, not guessed — see the geometry sweep this
+   was tuned against). That's simply too far for this app's low-altitude
+   urban traffic scenes to read as a "close chase". These values instead
+   target ~120-140m at that altitude — as close as the z19 tile ceiling
+   comfortably allows before zoom clamps and tiles start missing.
+   ========================================================================= */
+const TUNE = {
+  pitchDeg: 55,
+  droneScreenY: 0.42,
+  groundScreenY: 0.92,
+  zoomMin: 12.0,
+  zoomMax: 18.8,
+  smoothPos: 0.22,
+  smoothZoom: 0.10,
+  smoothPitch: 0.08,
+  smoothBearing: 0.09,
+  droneTargetPx: 95,
+  droneScaleMin: 1.0,
+  droneScaleMax: 22.0,
+  objModelDivisor: 50,
+  objModelMax: 3.0,
+  objMarkerDivisor: 33,
+  objMarkerMax: 5.0,
+};
+
+const D2R = Math.PI / 180;
+
+function clamp(v, lo, hi) {
+  return Math.max(lo, Math.min(hi, v));
 }
 
-// OpenStreetMap raster tiles — no API key required.
+function mppFromZoom(zoom, lat) {
+  return (78271.516964 * Math.cos(lat * D2R)) / Math.pow(2, zoom);
+}
+function zoomFromMpp(mpp, lat) {
+  return Math.log2((78271.516964 * Math.cos(lat * D2R)) / mpp);
+}
+function offsetLatLon(lat, lng, distM, headingRad) {
+  const dLat = (distM * Math.cos(headingRad)) / 111320.0;
+  const dLng = (distM * Math.sin(headingRad)) / (111320.0 * Math.max(0.2, Math.cos(lat * D2R)));
+  return { lat: lat + dLat, lng: lng + dLng };
+}
+
+// OpenStreetMap raster tiles — no API key required. maxzoom:19 matters: OSM
+// serves no z20 tiles, and without this a raster source requests z20 at the
+// chase cam's typical zoom and every tile 404s.
 const MAP_STYLE = {
   version: 8,
   sources: {
@@ -43,90 +74,106 @@ const MAP_STYLE = {
       type: "raster",
       tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
       tileSize: 256,
-      attribution: "© OpenStreetMap contributors",
+      minzoom: 0,
       maxzoom: 19,
+      attribution: "© OpenStreetMap contributors",
     },
   },
   layers: [
+    { id: "bg", type: "background", paint: { "background-color": "#070b14" } },
     {
-      id: "osm-tiles",
-      type: "raster",
-      source: "osm",
-      minzoom: 0,
-      maxzoom: 22,
+      id: "osm", type: "raster", source: "osm",
+      paint: {
+        "raster-brightness-min": 0.0,
+        "raster-brightness-max": 0.80,
+        "raster-contrast": 0.12,
+        "raster-saturation": -0.18,
+      },
     },
   ],
 };
 
-// ── Popup HTML builders ───────────────────────────────────────────────────────
-function makeObjectPopupHTML(o) {
-  const color     = classColor(o.cls);
-  const confColor = o.confidence >= 0.7 ? "#22c55e" : o.confidence >= 0.4 ? "#f59e0b" : "#ef4444";
-  const confPct   = (o.confidence * 100).toFixed(0);
-  return `
-    <div style="font-family:system-ui,sans-serif;font-size:12px;min-width:180px;color:#e2e8f0;background:#1e293b;border-radius:8px;overflow:hidden;">
-      <div style="background:${color}22;border-bottom:1px solid ${color}44;padding:8px 10px;display:flex;align-items:center;gap:8px;">
-        <span style="width:8px;height:8px;border-radius:50%;background:${color};box-shadow:0 0 6px ${color};flex-shrink:0;"></span>
-        <span style="font-weight:700;color:#fff;">ID ${o.track_id}</span>
-        <span style="margin-left:auto;font-size:10px;background:${color}33;color:${color};padding:1px 6px;border-radius:4px;">${o.cls.replace(/_/g, " ")}</span>
-      </div>
-      <div style="padding:8px 10px;display:flex;flex-direction:column;gap:4px;">
-        <div style="display:flex;justify-content:space-between;">
-          <span style="color:#94a3b8;">Confidence</span>
-          <span style="color:${confColor};font-weight:600;">${confPct}%</span>
-        </div>
-        <div style="display:flex;justify-content:space-between;">
-          <span style="color:#94a3b8;">Lat</span>
-          <span style="font-family:monospace;color:#e2e8f0;">${o.lat.toFixed(6)}</span>
-        </div>
-        <div style="display:flex;justify-content:space-between;">
-          <span style="color:#94a3b8;">Lng</span>
-          <span style="font-family:monospace;color:#e2e8f0;">${o.lng.toFixed(6)}</span>
-        </div>
-      </div>
-    </div>`;
+// ── Camera geometry helpers ──────────────────────────────────────────────
+function getFovRad(map) {
+  const t = map.transform;
+  if (t) {
+    if (typeof t._fov === "number" && t._fov > 0 && t._fov < 3) return t._fov;
+    if (typeof t.fov === "number" && t.fov > 3) return t.fov * D2R;
+  }
+  return 0.6435011087932844; // MapLibre default, 36.87 deg
+}
+function viewportH(map) {
+  const t = map.transform;
+  if (t && t.height) return t.height;
+  const c = map.getCanvas();
+  return (c && c.clientHeight) || 720;
 }
 
-function makeDronePopupHTML(d) {
-  return `
-    <div style="font-family:system-ui,sans-serif;font-size:12px;min-width:180px;color:#e2e8f0;background:#1e293b;border-radius:8px;overflow:hidden;">
-      <div style="background:#ef444422;border-bottom:1px solid #ef444444;padding:8px 10px;display:flex;align-items:center;gap:8px;">
-        <span style="font-weight:700;color:#fff;">Drone</span>
-        ${d.frame_index != null ? `<span style="margin-left:auto;font-size:10px;color:#94a3b8;">Frame ${d.frame_index}</span>` : ""}
-      </div>
-      <div style="padding:8px 10px;display:flex;flex-direction:column;gap:4px;">
-        <div style="display:flex;justify-content:space-between;">
-          <span style="color:#94a3b8;">Altitude</span>
-          <span style="color:#fbbf24;font-weight:600;">${parseFloat(d.alt).toFixed(1)} m</span>
-        </div>
-        <div style="display:flex;justify-content:space-between;">
-          <span style="color:#94a3b8;">Heading</span>
-          <span style="color:#e2e8f0;">${parseFloat(d.heading).toFixed(1)}°</span>
-        </div>
-        <div style="display:flex;justify-content:space-between;">
-          <span style="color:#94a3b8;">Pitch</span>
-          <span style="color:#e2e8f0;">${parseFloat(d.pitch ?? 0).toFixed(1)}°</span>
-        </div>
-        <div style="display:flex;justify-content:space-between;">
-          <span style="color:#94a3b8;">Lat</span>
-          <span style="font-family:monospace;color:#e2e8f0;">${parseFloat(d.lat).toFixed(6)}</span>
-        </div>
-        <div style="display:flex;justify-content:space-between;">
-          <span style="color:#94a3b8;">Lng</span>
-          <span style="font-family:monospace;color:#e2e8f0;">${parseFloat(d.lng).toFixed(6)}</span>
-        </div>
-      </div>
-    </div>`;
+/* TPP flight-following camera — solved exactly (not approximated) so the
+   drone lands on the same screen row at any altitude/zoom clamp. See
+   real.html's computeChase() for the full derivation. */
+function computeChase(pose, map, camState) {
+  const alt = clamp(pose.alt || 60, 4, 900);
+  const lat = pose.lat;
+  const pitchDeg = Math.min(TUNE.pitchDeg, camState.maxPitch - 1.5);
+  const pitch = pitchDeg * D2R;
+  const halfTan = Math.tan(getFovRad(map) / 2);
+  const pxDist = (0.5 / halfTan) * viewportH(map);
+  const axis = (90 - pitchDeg) * D2R;
+
+  const tD = Math.tan(Math.max(0.01, axis - Math.atan((1 - 2 * TUNE.droneScreenY) * halfTan)));
+  const tG = Math.tan(Math.max(0.02, axis - Math.atan((1 - 2 * TUNE.groundScreenY) * halfTan)));
+
+  let chaseBack, camAlt;
+  if (tG - tD > 1e-4) {
+    chaseBack = alt / (tG - tD);
+    camAlt = chaseBack * tG;
+  } else {
+    camAlt = alt * 1.5;
+    chaseBack = camAlt / tG;
+  }
+
+  let zoom = zoomFromMpp(camAlt / Math.cos(pitch) / pxDist, lat);
+  zoom = clamp(zoom, TUNE.zoomMin, TUNE.zoomMax);
+
+  const dist3d = mppFromZoom(zoom, lat) * pxDist;
+  camAlt = dist3d * Math.cos(pitch);
+  chaseBack = clamp(camAlt / tG, 20, 8000);
+  const groundSpan = dist3d * Math.sin(pitch);
+  const ahead = groundSpan - chaseBack;
+
+  const hdg = (pose.heading || 0) * D2R;
+  const c = offsetLatLon(pose.lat, pose.lng, ahead, hdg);
+
+  camState.camAlt = camAlt;
+  camState.chaseBack = chaseBack;
+  camState.camDist = Math.sqrt(chaseBack * chaseBack + Math.pow(Math.max(0, camAlt - alt), 2));
+
+  return { lng: c.lng, lat: c.lat, zoom, pitch: pitchDeg, bearing: pose.heading || 0 };
 }
 
-// ── Three.js custom layer: 3D drone + vehicle meshes + waypoint rings ─────────
-// MapLibre's renderingMode:"3d" render() no longer hands back a raw matrix —
-// it passes { modelViewProjectionMatrix, ... }, a world(mercator)-space ->
-// clip-space matrix. Positions absolute in that mercator [0,1) space are too
-// small-magnitude for float32 at this zoom (visible jitter), so every
-// position below is computed *relative to the drone's current location*
-// each frame, with that same offset folded into the camera matrix.
-function createVehicleLayer(id, map) {
+function updateCamera(pose, map, cam, camState) {
+  const t = computeChase(pose, map, camState);
+  if (cam.lng == null) {
+    cam.lng = t.lng; cam.lat = t.lat; cam.zoom = t.zoom; cam.pitch = t.pitch; cam.bearing = t.bearing;
+  } else {
+    cam.lng += (t.lng - cam.lng) * TUNE.smoothPos;
+    cam.lat += (t.lat - cam.lat) * TUNE.smoothPos;
+    cam.zoom += (t.zoom - cam.zoom) * TUNE.smoothZoom;
+    cam.pitch += (t.pitch - cam.pitch) * TUNE.smoothPitch;
+    let bd = t.bearing - cam.bearing;
+    while (bd > 180) bd -= 360;
+    while (bd < -180) bd += 360;
+    cam.bearing += bd * TUNE.smoothBearing;
+  }
+  map.jumpTo({ center: [cam.lng, cam.lat], zoom: cam.zoom, pitch: cam.pitch, bearing: cam.bearing });
+}
+
+// ── Three.js custom layer: drone + vehicles + trail ─────────────────────────
+// camState is the SAME mutable object updateCamera() writes chaseBack/camAlt
+// into every frame (a plain-object bridge, same pattern telemetryStore uses
+// for store — mutate in place, read directly, no React state round-trip).
+function createVehicleLayer(id, map, camState) {
   return {
     id,
     type: "custom",
@@ -141,21 +188,20 @@ function createVehicleLayer(id, map) {
       sun.position.set(80, 160, 200);
       this.scene.add(sun);
 
-      this.vehicles = new Map(); // track_id -> { mount, heading, cls }
+      this.vehicles = new Map(); // track_id -> { mount, heading, cls, enterStart, ring }
       this.trail = new FlightTrail();
       this.scene.add(this.trail.group);
 
-      // Drone model: built once, reused every frame — only its mount's
-      // position/scale and heading group's rotation change per frame.
       this.droneModel = buildDroneModel();
       this.droneMount = new THREE.Group();
-      this.droneMount.rotation.x = Math.PI / 2; // authored Y-up model -> world Z-up ground plane
+      this.droneMount.rotation.x = Math.PI / 2;
       this.droneHeading = new THREE.Group();
       this.droneHeading.add(this.droneModel);
       this.droneMount.add(this.droneHeading);
       this.droneMount.visible = false;
       this.scene.add(this.droneMount);
-      this.droneRender = null; // smoothed { lat, lng, alt, heading }, set on first fix
+      this.droneRender = null;
+
       this._frame = 0;
 
       this.renderer = new THREE.WebGLRenderer({ canvas: map.getCanvas(), context: gl, antialias: true });
@@ -163,12 +209,6 @@ function createVehicleLayer(id, map) {
     },
 
     render(gl, options) {
-      // MapLibre's modelViewProjectionMatrix does NOT take normalized (0..1)
-      // MercatorCoordinates — it takes "world" pixel coordinates (mercator
-      // fraction * worldSize, i.e. tileSize * 2^zoom, which is in the
-      // millions at typical zoom) for X/Y, and raw meters for Z. worldSize
-      // isn't in the public API but is the standard, widely-used escape
-      // hatch for this exact custom-layer use case.
       const worldSize = map.transform?.worldSize ?? 512 * Math.pow(2, map.getZoom());
 
       const drone = store.drone;
@@ -176,28 +216,22 @@ function createVehicleLayer(id, map) {
       const originMc = maplibregl.MercatorCoordinate.fromLngLat(originLngLat, 0);
       const originX = originMc.x * worldSize;
       const originY = originMc.y * worldSize;
-      // World-pixels per meter, horizontal only — Z is already raw meters,
-      // no conversion needed there.
       const worldPixelsPerMeter = originMc.meterInMercatorCoordinateUnits() * worldSize;
 
-      // Absolute world-pixel position of (lat,lng,altMeters), minus the
-      // origin — keeps every coordinate small-magnitude (a few hundred
-      // world-pixels at most) instead of the multi-million absolute value,
-      // which would otherwise blow past float32 precision and jitter.
       const toRelative = (lat, lng, altMeters = 0) => {
         const mc = maplibregl.MercatorCoordinate.fromLngLat([lng, lat], 0);
         return [mc.x * worldSize - originX, mc.y * worldSize - originY, altMeters];
       };
 
       this._frame++;
+      const now = performance.now();
 
-      // ── Drone: smoothed toward the latest telemetry fix each frame so it
-      // glides between updates instead of snapping.
+      // ── Drone: smoothed toward the latest fix so it glides between ticks.
       if (drone) {
         if (!this.droneRender) {
           this.droneRender = { lat: drone.lat, lng: drone.lng, alt: drone.alt, heading: drone.heading };
         } else {
-          const s = DRONE_SMOOTHING;
+          const s = 0.18;
           this.droneRender.lat += (drone.lat - this.droneRender.lat) * s;
           this.droneRender.lng += (drone.lng - this.droneRender.lng) * s;
           this.droneRender.alt += (drone.alt - this.droneRender.alt) * s;
@@ -209,9 +243,18 @@ function createVehicleLayer(id, map) {
 
         const [dx, dy, dz] = toRelative(this.droneRender.lat, this.droneRender.lng, this.droneRender.alt);
         this.droneMount.position.set(dx, dy, dz);
-        const s3d = worldPixelsPerMeter * DRONE_SCALE_BOOST;
-        this.droneMount.scale.set(s3d, DRONE_SCALE_BOOST, s3d);
+
+        // Distance-adaptive drone scale (real.html's droneTargetPx formula):
+        // sized so the model reads at a roughly constant on-screen pixel
+        // footprint regardless of how far the chase camera currently sits,
+        // instead of a fixed multiplier that shrinks visually as camDist grows.
+        const pxDist = (0.5 / Math.tan(getFovRad(map) / 2)) * viewportH(map);
+        const wantMeters = (TUNE.droneTargetPx / pxDist) * camState.camDist;
+        const dScale = clamp(wantMeters / 3.2, TUNE.droneScaleMin, TUNE.droneScaleMax);
+        const s3d = worldPixelsPerMeter * dScale;
+        this.droneMount.scale.set(s3d, dScale, s3d);
         this.droneHeading.rotation.y = -(this.droneRender.heading * Math.PI) / 180;
+        this.droneMount.rotation.z = (drone.roll || 0) * D2R;
         this.droneMount.visible = true;
 
         const rotors = this.droneModel.userData.rotors;
@@ -219,8 +262,14 @@ function createVehicleLayer(id, map) {
         this.droneModel.userData.strobe.visible = this._frame % 20 < 5;
       }
 
-      // ── Vehicles: mount (world position/scale + fixed ground-plane tilt)
-      // > heading (per-frame yaw) > the authored Y-up model, unchanged.
+      // ── Vehicles: mount (world position, meters->world-pixels) > heading
+      // (yaw) > modelGroup / markerGroup, each with its own altitude-adaptive
+      // scale — markers get boosted harder than the model itself so glow/ring
+      // stay legible from a distant chase camera, exactly like real.html's
+      // objModelDivisor(90)/objMarkerDivisor(60) split.
+      const modelScale = clamp(camState.chaseBack / TUNE.objModelDivisor, 1, TUNE.objModelMax);
+      const markerScale = clamp(camState.chaseBack / TUNE.objMarkerDivisor, 1.2, TUNE.objMarkerMax);
+
       const seen = new Set();
       store.objects.forEach((obj) => {
         seen.add(obj.track_id);
@@ -228,23 +277,41 @@ function createVehicleLayer(id, map) {
         if (!entry || entry.cls !== obj.cls) {
           if (entry) this.scene.remove(entry.mount);
           const mount = new THREE.Group();
-          mount.rotation.x = Math.PI / 2; // authored Y-up model -> world Z-up ground plane
+          mount.rotation.x = Math.PI / 2;
           const heading = new THREE.Group();
           const color = classColor(obj.cls);
-          heading.add(buildVehicleModel(obj.cls, color));
-          heading.add(buildMarker(color));
+          const modelGroup = new THREE.Group();
+          modelGroup.add(buildVehicleModel(obj.cls, color));
+          const markerGroup = new THREE.Group();
+          const marker = buildMarker(color);
+          markerGroup.add(marker);
+          heading.add(modelGroup, markerGroup);
           mount.add(heading);
           this.scene.add(mount);
-          entry = { mount, heading, cls: obj.cls };
+          entry = {
+            mount, heading, modelGroup, markerGroup, cls: obj.cls,
+            ring: marker.userData.ring, enterStart: now,
+          };
           this.vehicles.set(obj.track_id, entry);
         }
         const [x, y, z] = toRelative(obj.lat, obj.lng, 0);
         entry.mount.position.set(x, y, z);
-        // Local X/Z (this model's width/length) land on world X/Y (world
-        // pixels) after the tilt above; local Y (height) lands on world Z,
-        // which is already raw meters — so only X/Z get the pixel scale.
         entry.mount.scale.set(worldPixelsPerMeter, 1, worldPixelsPerMeter);
         entry.heading.rotation.y = obj.heading != null ? -(obj.heading * Math.PI) / 180 : 0;
+
+        // Entering pop-in (0 -> 1 over 300ms) multiplies on top of the
+        // altitude-adaptive scale; steady-state just applies the adaptive
+        // scale plus a gentle idle ring pulse.
+        let enterT = 1;
+        if (entry.enterStart != null) {
+          enterT = Math.min(1, (now - entry.enterStart) / 300);
+          if (enterT >= 1) entry.enterStart = null;
+        }
+        entry.modelGroup.scale.setScalar(Math.max(0.05, modelScale * enterT));
+        entry.markerGroup.scale.setScalar(Math.max(0.05, markerScale * enterT));
+        if (entry.enterStart == null && entry.ring) {
+          entry.ring.scale.setScalar(1 + 0.06 * Math.sin(now * 0.003));
+        }
       });
       this.vehicles.forEach((entry, trackId) => {
         if (!seen.has(trackId)) {
@@ -253,7 +320,7 @@ function createVehicleLayer(id, map) {
         }
       });
 
-      // ── Flight-path ribbon — rises through the air to meet the drone
+      // ── Flight-path ribbon.
       this.trail.update(store.flightPath, toRelative, worldPixelsPerMeter);
 
       this.camera.projectionMatrix
@@ -262,7 +329,7 @@ function createVehicleLayer(id, map) {
 
       this.renderer.resetState();
       this.renderer.render(this.scene, this.camera);
-      map.triggerRepaint(); // keep animating: drone/vehicles move and rotors spin every frame
+      map.triggerRepaint();
     },
 
     onRemove() {
@@ -273,245 +340,168 @@ function createVehicleLayer(id, map) {
   };
 }
 
-// ── Component ─────────────────────────────────────────────────────────────────
+// ── Component ─────────────────────────────────────────────────────────────
+// Counts panel is intentionally NOT reimplemented here — the restored
+// outhouse dashboard (HUD + Sidebar) already shows per-class counts and a
+// running total; a second copy in this corner would just be a duplicate.
+// Status/warn badges and the sky/vignette cosmetic overlays stay: they're
+// real.html's cinematic chrome, not dashboard data, so nothing else covers them.
 export default function DroneMap() {
-  const containerRef    = useRef(null);
-  const mapRef          = useRef(null);
-  const dronePopupRef   = useRef(null);
-  const objectPopupRef  = useRef(null); // single reusable popup for vehicle meshes
-  const vehicleLayerRef = useRef(null); // three.js custom layer — read its smoothed drone position for the camera
-  const rafRef          = useRef(null);
-  const hasCenteredRef  = useRef(false);
-  // Follow-cam: last { lat, lng, heading } we pointed the camera at, so we
-  // only issue jumpTo() when the drone has actually moved/turned
-  const lastCameraRef   = useRef({ lat: null, lng: null, heading: null });
+  const containerRef = useRef(null);
+  const mapRef = useRef(null);
+  const vehicleLayerRef = useRef(null);
+  const rafRef = useRef(null);
+  const camRef = useRef({ lng: null, lat: null, zoom: null, pitch: null, bearing: null });
+  const camStateRef = useRef({ maxPitch: 60, camAlt: 100, chaseBack: 150, camDist: 200 });
+  // Scroll to zoom / drag to pan hands control to the user; the chase cam
+  // stops overwriting the view every frame until they click "Follow drone"
+  // again. manualRef is what the rAF loop reads (state wouldn't be visible
+  // inside a closure created once on mount); manual (state) just drives the
+  // button's visibility.
+  const manualRef = useRef(false);
+  const [manual, setManual] = useState(false);
 
-  // "follow" = camera locks onto the drone every frame (existing behavior).
-  // "free" = the rAF loop never touches the camera, so the user's own
-  // drag/scroll/rotate on the map sticks instead of being overridden.
-  // Kept as both state (so the checkboxes' checked= reflects it) and a ref
-  // (so the rAF loop — created once, inside the effect below — always reads
-  // the current value instead of a value captured at effect-creation time).
-  const [cameraMode, setCameraMode] = useState("follow");
-  const cameraModeRef = useRef("follow");
-  function selectCameraMode(mode) {
-    cameraModeRef.current = mode;
-    setCameraMode(mode);
-  }
+  const snapshot = useTelemetrySync();
 
   useEffect(() => {
-    // StrictMode double-invokes this effect in dev (mount → cleanup → mount).
-    // map.remove() in cleanup is synchronous, but the map's "load" event is
-    // async and can still fire afterward — this flag stops that stale
-    // callback from running setup logic on an already-destroyed map.
     let cancelled = false;
 
-    // ── Init map ──────────────────────────────────────────────────────────────
-    const map = new maplibregl.Map({
-      container: containerRef.current,
-      style: MAP_STYLE,
-      center: DEFAULT_CENTER,
-      zoom: DEFAULT_ZOOM,
-      pitch: DEFAULT_PITCH,
-      bearing: DEFAULT_BEARING,
-      antialias: true,
-      attributionControl: false,
-    });
+    // interactive:false disables every handler at once; build it disabled
+    // then enable only scroll-to-zoom and drag-to-pan. dragRotate/keyboard/
+    // boxZoom/touchZoomRotate stay off — bearing and pitch remain the chase
+    // cam's job, so a rotate gesture can't fight it mid-follow.
+    let map;
+    try {
+      map = new maplibregl.Map({
+        container: containerRef.current,
+        style: MAP_STYLE,
+        center: [78.428228, 17.417393],
+        zoom: 17,
+        pitch: 60,
+        bearing: 0,
+        interactive: false,
+        attributionControl: false,
+        antialias: true,
+        fadeDuration: 0,
+        maxPitch: 85,
+      });
+      camStateRef.current.maxPitch = 85;
+    } catch {
+      map = new maplibregl.Map({
+        container: containerRef.current,
+        style: MAP_STYLE,
+        center: [78.428228, 17.417393],
+        zoom: 17,
+        pitch: 60,
+        bearing: 0,
+        interactive: false,
+        attributionControl: false,
+        antialias: true,
+        fadeDuration: 0,
+      });
+      camStateRef.current.maxPitch = 60;
+    }
+    if (typeof map.getMaxPitch === "function") {
+      try { camStateRef.current.maxPitch = map.getMaxPitch(); } catch { /* keep assumed value */ }
+    }
+    map.scrollZoom.enable();
+    map.dragPan.enable();
+    map.doubleClickZoom.enable();
 
-    map.addControl(new maplibregl.AttributionControl({ compact: true }), "bottom-right");
-    map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), "bottom-right");
+    const goManual = () => {
+      if (manualRef.current) return;
+      manualRef.current = true;
+      setManual(true);
+    };
+    map.on("dragstart", goManual);
+    map.on("wheel", goManual);
+    map.on("touchstart", goManual);
 
     mapRef.current = map;
 
     map.on("load", () => {
-      if (cancelled) return; // this map was already torn down by a StrictMode phantom cleanup
+      if (cancelled) return;
 
-      const vehicleLayer = createVehicleLayer("vehicles-3d", map);
+      const vehicleLayer = createVehicleLayer("vehicles-3d", map, camStateRef.current);
       map.addLayer(vehicleLayer);
       vehicleLayerRef.current = vehicleLayer;
 
-      // ── Camera footprint source + layer ───────────────────────────────────
-      map.addSource("footprint", {
-        type: "geojson",
-        data: { type: "Feature", geometry: { type: "Polygon", coordinates: [[]] } },
-      });
-
-      map.addLayer({
-        id: "footprint-fill",
-        type: "fill",
-        source: "footprint",
-        paint: {
-          "fill-color": "#facc15",
-          "fill-opacity": 0.07,
-        },
-      });
-
-      map.addLayer({
-        id: "footprint-outline",
-        type: "line",
-        source: "footprint",
-        paint: {
-          "line-color": "#facc15",
-          "line-width": 1.8,
-          "line-opacity": 0.75,
-          "line-dasharray": [4, 3],
-        },
-      });
-
-      // Popups: the drone and vehicles are now 3D meshes, not DOM elements,
-      // so both are opened manually from the nearest-hit test in the map's
-      // own click handler below rather than per-marker click listeners.
-      const dronePopup = new maplibregl.Popup({
-        closeButton: true,
-        closeOnClick: false,
-        offset: 18,
-        className: "tel-popup-wrap",
-        maxWidth: "220px",
-      });
-      dronePopupRef.current = dronePopup;
-
-      const objectPopup = new maplibregl.Popup({
-        closeButton: true,
-        closeOnClick: false,
-        offset: 12,
-        className: "tel-popup-wrap",
-        maxWidth: "220px",
-      });
-      objectPopupRef.current = objectPopup;
-
-      // ── rAF loop: follow-cam, camera footprint, open-popup refresh ─────────
-      // (The drone model, vehicle meshes, and waypoint rings are updated
-      // inside the three.js custom layer's own render(), driven by its
-      // triggerRepaint().)
       function renderLoop() {
         rafRef.current = requestAnimationFrame(renderLoop);
-        if (!mapRef.current) return;
-
-        if (store.drone) {
-          // Camera and the 3D drone model must agree on where the drone
-          // *actually* is — the model renders from a smoothed/lagged
-          // position (droneRender, in the three.js layer) so it doesn't
-          // jump between telemetry ticks. Centering the camera on the raw
-          // instantaneous telemetry instead means the two drift apart while
-          // the drone is moving, and the model visibly sits off-center. Use
-          // the same smoothed value for both, falling back to raw telemetry
-          // only before the layer has produced one yet.
-          const smoothed = vehicleLayerRef.current?.droneRender;
-          const lat = smoothed?.lat ?? store.drone.lat;
-          const lng = smoothed?.lng ?? store.drone.lng;
-          const alt = smoothed?.alt ?? store.drone.alt;
-          const heading = smoothed?.heading ?? store.drone.heading;
-          const center = droneCameraCenter(lat, lng, alt, heading);
-
-          if (dronePopup.isOpen()) {
-            dronePopup.setHTML(makeDronePopupHTML(store.drone));
-          }
-
-          if (!hasCenteredRef.current) {
-            // First fix: snap straight there (no flyTo — an animated fly-in
-            // would fight the continuous jumpTo() that starts immediately
-            // on the very next frame below).
-            map.jumpTo({ center, zoom: INITIAL_ZOOM, pitch: DEFAULT_PITCH, bearing: heading });
-            lastCameraRef.current = { lat, lng, heading };
-            hasCenteredRef.current = true;
-          } else if (cameraModeRef.current === "follow") {
-            const cam = lastCameraRef.current;
-            if (cam.lat !== lat || cam.lng !== lng || cam.heading !== heading) {
-              map.jumpTo({ center, bearing: heading });
-              lastCameraRef.current = { lat, lng, heading };
-            }
-          }
-        }
-
-        if (store.footprint && store.footprint.length === 4) {
-          const ring = store.footprint.map((p) => [p.lng, p.lat]);
-          ring.push(ring[0]); // close polygon
-          const src = map.getSource("footprint");
-          if (src) {
-            src.setData({
-              type: "Feature",
-              geometry: { type: "Polygon", coordinates: [ring] },
-            });
-          }
-        }
+        if (!mapRef.current || !store.drone || manualRef.current) return;
+        updateCamera(store.drone, map, camRef.current, camStateRef.current);
       }
-
       renderLoop();
-    }); // map.on("load")
-
-    // Click the drone or a vehicle (nearest projected screen position within
-    // tolerance) to open its popup; click empty map to close whatever's open.
-    map.on("click", (e) => {
-      if (store.drone) {
-        const p = map.project([store.drone.lng, store.drone.lat]);
-        if (Math.hypot(p.x - e.point.x, p.y - e.point.y) < DRONE_HIT_RADIUS_PX) {
-          objectPopupRef.current?.remove();
-          dronePopupRef.current
-            ?.setLngLat([store.drone.lng, store.drone.lat])
-            .setHTML(makeDronePopupHTML(store.drone))
-            .addTo(map);
-          return;
-        }
-      }
-
-      let nearest = null;
-      let nearestDist = OBJECT_HIT_RADIUS_PX;
-      store.objects.forEach((obj) => {
-        const p = map.project([obj.lng, obj.lat]);
-        const d = Math.hypot(p.x - e.point.x, p.y - e.point.y);
-        if (d < nearestDist) {
-          nearestDist = d;
-          nearest = obj;
-        }
-      });
-
-      if (nearest) {
-        dronePopupRef.current?.remove();
-        objectPopupRef.current
-          ?.setLngLat([nearest.lng, nearest.lat])
-          .setHTML(makeObjectPopupHTML(nearest))
-          .addTo(map);
-      } else {
-        dronePopupRef.current?.remove();
-        objectPopupRef.current?.remove();
-      }
     });
 
     return () => {
       cancelled = true;
       cancelAnimationFrame(rafRef.current);
-      dronePopupRef.current?.remove();
-      objectPopupRef.current?.remove();
       map.remove();
       mapRef.current = null;
-      hasCenteredRef.current = false;
-      lastCameraRef.current = { lat: null, lng: null, heading: null };
+      camRef.current = { lng: null, lat: null, zoom: null, pitch: null, bearing: null };
+      manualRef.current = false;
     };
   }, []);
 
+  function resumeFollow() {
+    manualRef.current = false;
+    setManual(false);
+    // Null out cam so the next chase-cam frame snaps straight to the drone
+    // instead of smoothing in from wherever the user left the view.
+    camRef.current = { lng: null, lat: null, zoom: null, pitch: null, bearing: null };
+  }
+
+  const showWarn = !snapshot.drone;
+
   return (
-    <div className="relative h-full w-full">
+    <div className="relative h-full w-full overflow-hidden" style={{ background: "#05070c" }}>
       <div ref={containerRef} className="h-full w-full" />
 
-      {/* Camera mode — mutually exclusive: exactly one is checked at a time. */}
-      <div className="absolute right-3 top-3 z-[400] flex flex-col gap-1.5 rounded-xl border border-slate-700/60 bg-slate-900/92 px-3 py-2.5 text-xs text-slate-200 shadow-2xl shadow-black/40 backdrop-blur-md">
-        <label className="flex cursor-pointer items-center gap-2">
-          <input
-            type="checkbox"
-            checked={cameraMode === "follow"}
-            onChange={() => selectCameraMode("follow")}
-          />
-          Follow drone
-        </label>
-        <label className="flex cursor-pointer items-center gap-2">
-          <input
-            type="checkbox"
-            checked={cameraMode === "free"}
-            onChange={() => selectCameraMode("free")}
-          />
-          Free roam
-        </label>
+      {/* Atmospheric haze over the far field. Cosmetic, matches real.html's #sky. */}
+      <div
+        className="pointer-events-none absolute inset-x-0 top-0 z-[4]"
+        style={{
+          height: "46%",
+          background:
+            "linear-gradient(to bottom, rgba(8,14,28,0.85) 0%, rgba(10,18,34,0.55) 45%, rgba(10,18,34,0) 100%)",
+        }}
+      />
+      <div
+        className="pointer-events-none absolute inset-0 z-[5]"
+        style={{ background: "radial-gradient(ellipse at center, rgba(0,0,0,0) 66%, rgba(0,0,0,0.42) 100%)" }}
+      />
+
+      <div
+        className="pointer-events-none absolute z-10 tracking-wider"
+        style={{ bottom: 18, right: 18, fontSize: 11, color: "#6cff6c", textShadow: "0 0 8px rgba(108,255,108,0.6)" }}
+      >
+        ● LIVE 3D
       </div>
+
+      {showWarn && (
+        <div
+          className="pointer-events-none absolute z-10 tracking-wider"
+          style={{ bottom: 18, left: 18, fontSize: 11, color: "#ffcf4d", textShadow: "0 0 8px rgba(255,207,77,0.6)" }}
+        >
+          ▲ NO DRONE TELEMETRY
+        </div>
+      )}
+
+      {manual && (
+        <button
+          onClick={resumeFollow}
+          className="absolute z-10 rounded-full px-4 py-1.5 text-xs font-semibold tracking-wide transition-colors hover:brightness-125"
+          style={{
+            bottom: 18, left: "50%", transform: "translateX(-50%)",
+            background: "rgba(8,11,18,0.75)", backdropFilter: "blur(8px)",
+            border: "1px solid rgba(147,20,255,0.55)", color: "#f2f2f7",
+            boxShadow: "0 8px 24px rgba(0,0,0,0.5)",
+          }}
+        >
+          ▶ Follow drone
+        </button>
+      )}
     </div>
   );
 }
