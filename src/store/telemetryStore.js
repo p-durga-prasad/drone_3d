@@ -10,7 +10,7 @@
 const MAX_PATH_POINTS = 2000;
 
 export const store = {
-  drone: null,           // { lat, lng, alt, heading, pitch, frame_index }
+  drone: null,           // { lat, lng, alt, heading, pitch, roll, frame_index }
   footprint: null,       // [{ lat, lng }, ...] 4 corners
   objects: new Map(),    // track_id -> { lat, lng, cls, confidence, track_id }
   flightPath: [],        // [{ lat, lng, alt }, ...] bounded history
@@ -80,9 +80,10 @@ export function applyFrame(raw) {
   const alt      = parseFloat(telem.rel_alt   ?? telem.altitude ?? 0);
   const heading  = parseFloat(telem.gb_yaw    ?? telem.yaw ?? telem.heading ?? 0);
   const pitch    = parseFloat(telem.gb_pitch  ?? 0);
+  const roll     = parseFloat(telem.gb_roll   ?? 0);
 
   if (!isNaN(droneLat) && !isNaN(droneLng)) {
-    store.drone = { lat: droneLat, lng: droneLng, alt, heading, pitch, frame_index: raw.frame_index };
+    store.drone = { lat: droneLat, lng: droneLng, alt, heading, pitch, roll: isNaN(roll) ? 0 : roll, frame_index: raw.frame_index };
 
     // Append to flight path — only if position actually changed
     const last = store.flightPath[store.flightPath.length - 1];

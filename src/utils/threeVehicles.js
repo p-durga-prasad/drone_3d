@@ -260,6 +260,26 @@ export function buildDroneModel() {
   return g;
 }
 
+const _ringGeoCache = {};
+function ringGeometry() {
+  if (!_ringGeoCache.geo) _ringGeoCache.geo = new THREE.RingGeometry(1.35, 1.75, 22);
+  return _ringGeoCache.geo;
+}
+
+// Ground ring, idle-pulsed by the caller (root.userData.ring.scale) — same
+// RingGeometry(1.35, 1.75, 22) as the reference digital-twin renderer's
+// makeObjectEntry() marker ring.
+function buildRing(colorHex) {
+  const mat = new THREE.MeshBasicMaterial({
+    color: colorHex, transparent: true, opacity: 0.75, side: THREE.DoubleSide,
+    blending: THREE.AdditiveBlending, depthWrite: false,
+  });
+  const mesh = new THREE.Mesh(ringGeometry(), mat);
+  mesh.rotation.x = -Math.PI / 2;
+  mesh.position.y = 0.12;
+  return mesh;
+}
+
 export function buildMarker(colorHex, discRadius = 1.7, beamRadius = 0.22, beamHeight = 5.5) {
   const g = new THREE.Group();
 
@@ -274,6 +294,9 @@ export function buildMarker(colorHex, discRadius = 1.7, beamRadius = 0.22, beamH
   disc.position.y = 0.06;
   g.add(disc);
 
+  const ring = buildRing(colorHex);
+  g.add(ring);
+
   const beam = new THREE.Mesh(
     new THREE.CylinderGeometry(beamRadius, beamRadius * 1.25, beamHeight, 10, 1, true),
     new THREE.MeshBasicMaterial({
@@ -284,5 +307,6 @@ export function buildMarker(colorHex, discRadius = 1.7, beamRadius = 0.22, beamH
   beam.position.y = beamHeight / 2;
   g.add(beam);
 
+  g.userData.ring = ring;
   return g;
 }
