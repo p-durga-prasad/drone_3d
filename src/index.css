@@ -1,0 +1,76 @@
+@import "tailwindcss";
+@import "maplibre-gl/dist/maplibre-gl.css";
+
+/* ── MapLibre popup reset — use our own dark style ─────────── */
+.maplibregl-popup-content {
+  background: transparent !important;
+  padding: 0 !important;
+  border-radius: 8px !important;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5) !important;
+  border: 1px solid rgba(148, 163, 184, 0.15) !important;
+}
+
+.maplibregl-popup-tip {
+  border-top-color: #1e293b !important;
+  border-bottom-color: #1e293b !important;
+}
+
+.maplibregl-popup-close-button {
+  color: #94a3b8 !important;
+  font-size: 16px !important;
+  padding: 4px 8px !important;
+  right: 2px !important;
+  top: 2px !important;
+  background: transparent !important;
+}
+
+.maplibregl-popup-close-button:hover {
+  color: #fff !important;
+  background: rgba(255,255,255,0.1) !important;
+  border-radius: 4px !important;
+}
+
+/* ── MapLibre navigation control dark theme ─────────────────── */
+.maplibregl-ctrl-group {
+  background: rgba(15, 23, 42, 0.9) !important;
+  border: 1px solid rgba(148, 163, 184, 0.2) !important;
+  border-radius: 8px !important;
+  overflow: hidden !important;
+}
+
+.maplibregl-ctrl-group button {
+  background: transparent !important;
+  color: #94a3b8 !important;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.15) !important;
+}
+
+.maplibregl-ctrl-group button:hover {
+  background: rgba(255, 255, 255, 0.08) !important;
+  color: #fff !important;
+}
+
+.maplibregl-ctrl-group button:last-child {
+  border-bottom: none !important;
+}
+
+.maplibregl-ctrl-group button span {
+  filter: invert(0.6) !important;
+}
+
+/* ── Attribution ─────────────────────────────────────────────── */
+.maplibregl-ctrl-attrib {
+  background: rgba(15, 23, 42, 0.75) !important;
+  color: #64748b !important;
+  font-size: 10px !important;
+  border-radius: 4px !important;
+}
+
+.maplibregl-ctrl-attrib a {
+  color: #94a3b8 !important;
+}
+
+/* ── Scrollbar thin ──────────────────────────────────────────── */
+::-webkit-scrollbar        { width: 4px; }
+::-webkit-scrollbar-track  { background: transparent; }
+::-webkit-scrollbar-thumb  { background: #334155; border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: #475569; }
