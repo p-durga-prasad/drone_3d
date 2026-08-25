@@ -134,6 +134,8 @@ export function applyFrame(raw) {
     // last known fix for this track_id (same formula as builder.py), else
     // hold the previous heading rather than snapping to 0 on a near-zero move.
     const prev = store.objects.get(id);
+    console.log("hello")
+    if (prev) console.log("duplicate track_id", id);
     const rawHeading = parseFloat(obj.heading_deg ?? obj.heading);
     let heading = prev?.heading ?? 0;
     if (!isNaN(rawHeading)) {

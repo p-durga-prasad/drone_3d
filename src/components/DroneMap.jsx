@@ -44,6 +44,7 @@ const TUNE = {
   objModelMax: 3.0,
   objMarkerDivisor: 33,
   objMarkerMax: 5.0,
+  objHeadingSmoothing: 0,
 };
 
 const D2R = Math.PI / 180;
@@ -291,13 +292,24 @@ function createVehicleLayer(id, map, camState) {
           entry = {
             mount, heading, modelGroup, markerGroup, cls: obj.cls,
             ring: marker.userData.ring, enterStart: now,
+            renderHeading: obj.heading ?? 0, // smoothed facing direction, so it turns rather than snaps
           };
           this.vehicles.set(obj.track_id, entry);
         }
         const [x, y, z] = toRelative(obj.lat, obj.lng, 0);
         entry.mount.position.set(x, y, z);
         entry.mount.scale.set(worldPixelsPerMeter, 1, worldPixelsPerMeter);
-        entry.heading.rotation.y = obj.heading != null ? -(obj.heading * Math.PI) / 180 : 0;
+
+        // Continuously rotate to face the direction of travel instead of
+        // snapping — same short-way-around wrap-safe lerp as the drone's
+        // own heading smoothing above.
+        if (obj.heading != null) {
+          let dh = obj.heading - entry.renderHeading;
+          while (dh > 180) dh -= 360;
+          while (dh < -180) dh += 360;
+          entry.renderHeading += dh * TUNE.objHeadingSmoothing;
+        }
+        entry.heading.rotation.y = -(entry.renderHeading * Math.PI) / 180;
 
         // Entering pop-in (0 -> 1 over 300ms) multiplies on top of the
         // altitude-adaptive scale; steady-state just applies the adaptive
