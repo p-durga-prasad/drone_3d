@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Radio } from "lucide-react";
 import { useTelemetryWS } from "./hooks/useTelemetryWS";
 import { useTelemetrySync } from "./hooks/useTelemetrySync";
+import { store, resetStore } from "./store/telemetryStore";
 import DroneMap from "./components/DroneMap";
 import HUD from "./components/HUD";
 import Sidebar from "./components/Sidebar";
@@ -15,13 +16,30 @@ function DroneHeaderIcon() {
     </svg>
   );
 }
-
+const url=import.meta.env.VITE_PATH
 export default function App() {
   const [connected, setConnected] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  // WS stays closed until the user explicitly clicks Start — no auto-connect
+  // on load. hasSession tracks whether there's existing data (either
+  // restored from localStorage on this load, or left over from a prior
+  // Stop) worth resuming instead of wiping.
+  const [running, setRunning] = useState(false);
+  const [hasSession, setHasSession] = useState(
+    () => store.objects.size > 0 || store.flightPath.length > 0
+  );
   const snapshot = useTelemetrySync();
 
-  useTelemetryWS(setConnected);
+  useTelemetryWS(running, setConnected);
+
+  function handleStart() {
+    if (!hasSession) resetStore(); // fresh session: wipe store + localStorage together
+    setRunning(true);
+  }
+  function handleStop() {
+    setRunning(false);
+    setHasSession(true);
+  }
 
   return (
     <div className="flex h-screen flex-col overflow-hidden bg-slate-900 font-sans">
@@ -49,24 +67,42 @@ export default function App() {
 
           <span className="flex items-center gap-1.5 rounded-full border border-slate-700/60 bg-slate-800/60 px-2.5 py-1 font-mono text-[10px] text-slate-400">
             <Radio size={11} className="text-slate-500" />
-            ws://192.168.123.251:8055
+            {url}
           </span>
         </div>
 
-        <div
-          className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 transition-colors ${
-            connected ? "border-green-500/30 bg-green-500/10" : "border-red-500/30 bg-red-500/10"
-          }`}
-        >
-          <span className="relative flex h-2 w-2">
-            {connected && (
-              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-green-400 opacity-75" />
-            )}
-            <span className={`relative inline-flex h-2 w-2 rounded-full ${connected ? "bg-green-400" : "bg-red-500"}`} />
-          </span>
-          <span className={`text-xs font-semibold ${connected ? "text-green-400" : "text-red-400"}`}>
-            {connected ? "Connected" : "Connecting…"}
-          </span>
+        <div className="flex items-center gap-2.5">
+          <div
+            className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 transition-colors ${
+              connected ? "border-green-500/30 bg-green-500/10" : "border-red-500/30 bg-red-500/10"
+            }`}
+          >
+            <span className="relative flex h-2 w-2">
+              {connected && (
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-green-400 opacity-75" />
+              )}
+              <span className={`relative inline-flex h-2 w-2 rounded-full ${connected ? "bg-green-400" : "bg-red-500"}`} />
+            </span>
+            <span className={`text-xs font-semibold ${connected ? "text-green-400" : "text-red-400"}`}>
+              {connected ? "Connected" : running ? "Connecting…" : "Stopped"}
+            </span>
+          </div>
+
+          {running ? (
+            <button
+              onClick={handleStop}
+              className="cursor-pointer rounded-full border border-red-500/40 bg-red-500/10 px-3 py-1 text-xs font-semibold text-red-400 transition-colors hover:bg-red-500/20"
+            >
+              Stop
+            </button>
+          ) : (
+            <button
+              onClick={handleStart}
+              className="cursor-pointer rounded-full border border-green-500/40 bg-green-500/10 px-3 py-1 text-xs font-semibold text-green-400 transition-colors hover:bg-green-500/20"
+            >
+              {hasSession ? "Resume" : "Start"}
+            </button>
+          )}
         </div>
       </header>
 

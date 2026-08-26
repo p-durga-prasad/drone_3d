@@ -47,6 +47,13 @@ const TUNE = {
   objHeadingSmoothing: 0,
 };
 
+// Frames a vehicle can go without a fresh detection before it's rendered as
+// "frozen" (dimmed, to read as blurred/faded) instead of fully solid, so
+// stale/passed vehicles are visually distinct from ones just re-detected.
+// Configurable via .env; defaults to 2 if unset or not a number.
+const STALE_FRAME_THRESHOLD = Number(import.meta.env.VITE_STALE_FRAME_THRESHOLD) || 2;
+const STALE_OPACITY = 0.35;
+
 const D2R = Math.PI / 180;
 
 function clamp(v, lo, hi) {
@@ -63,6 +70,51 @@ function offsetLatLon(lat, lng, distM, headingRad) {
   const dLat = (distM * Math.cos(headingRad)) / 111320.0;
   const dLng = (distM * Math.sin(headingRad)) / (111320.0 * Math.max(0.2, Math.cos(lat * D2R)));
   return { lat: lat + dLat, lng: lng + dLng };
+}
+
+// For-testing ID badges: one small DOM element per tracked vehicle, pinned
+// via map.project() (plain screen-space projection MapLibre already
+// exposes). Deliberately not a Three.js sprite/label in the custom layer —
+// this layer's camera is a raw projectionMatrix with no real position/view
+// transform behind it (see createVehicleLayer below), which billboarding
+// depends on, so a DOM overlay is the predictable option here.
+function syncIdLabels(map, container, labelsMap) {
+  if (!container) return;
+  const seen = new Set();
+  store.objects.forEach((obj) => {
+    seen.add(obj.track_id);
+    let el = labelsMap.get(obj.track_id);
+    if (!el) {
+      el = document.createElement("div");
+      Object.assign(el.style, {
+        position: "absolute",
+        left: "0",
+        top: "0",
+        padding: "1px 5px",
+        fontSize: "10px",
+        fontFamily: "monospace",
+        fontWeight: "700",
+        color: "#fff",
+        background: "rgba(15,23,42,0.82)",
+        border: "1px solid rgba(255,255,255,0.3)",
+        borderRadius: "4px",
+        whiteSpace: "nowrap",
+        pointerEvents: "none",
+      });
+      container.appendChild(el);
+      labelsMap.set(obj.track_id, el);
+    }
+    el.textContent = `#${obj.track_id}`;
+    const p = map.project([obj.lng, obj.lat]);
+    // Lifted clear of the mesh/marker itself, centered above it.
+    el.style.transform = `translate(${p.x}px, ${p.y - 24}px) translate(-50%, -100%)`;
+  });
+  labelsMap.forEach((el, id) => {
+    if (!seen.has(id)) {
+      el.remove();
+      labelsMap.delete(id);
+    }
+  });
 }
 
 // OpenStreetMap raster tiles — no API key required. maxzoom:19 matters: OSM
@@ -289,9 +341,20 @@ function createVehicleLayer(id, map, camState) {
           heading.add(modelGroup, markerGroup);
           mount.add(heading);
           this.scene.add(mount);
+
+          // Collected once here (not every frame) so the per-frame
+          // stale/live check below is just a cheap opacity assignment.
+          const materials = [];
+          heading.traverse((child) => {
+            if (child.material) {
+              child.material.transparent = true;
+              materials.push(child.material);
+            }
+          });
+
           entry = {
             mount, heading, modelGroup, markerGroup, cls: obj.cls,
-            ring: marker.userData.ring, enterStart: now,
+            ring: marker.userData.ring, enterStart: now, materials,
             renderHeading: obj.heading ?? 0, // smoothed facing direction, so it turns rather than snaps
           };
           this.vehicles.set(obj.track_id, entry);
@@ -324,6 +387,13 @@ function createVehicleLayer(id, map, camState) {
         if (entry.enterStart == null && entry.ring) {
           entry.ring.scale.setScalar(1 + 0.06 * Math.sin(now * 0.003));
         }
+
+        // "Frozen" vehicles (no fresh detection for STALE_FRAME_THRESHOLD+
+        // frames) render dimmed instead of solid, to differentiate them
+        // from vehicles the model is actively re-detecting right now.
+        const staleFrames = store.frameCount - (obj.lastSeenFrame ?? store.frameCount);
+        const targetOpacity = staleFrames >= STALE_FRAME_THRESHOLD ? STALE_OPACITY : 1;
+        for (let i = 0; i < entry.materials.length; i++) entry.materials[i].opacity = targetOpacity;
       });
       this.vehicles.forEach((entry, trackId) => {
         if (!seen.has(trackId)) {
@@ -359,6 +429,7 @@ function createVehicleLayer(id, map, camState) {
 // Status/warn badges and the sky/vignette cosmetic overlays stay: they're
 // real.html's cinematic chrome, not dashboard data, so nothing else covers them.
 export default function DroneMap() {
+  console.log("data",)
   const containerRef = useRef(null);
   const mapRef = useRef(null);
   const vehicleLayerRef = useRef(null);
@@ -372,6 +443,8 @@ export default function DroneMap() {
   // button's visibility.
   const manualRef = useRef(false);
   const [manual, setManual] = useState(false);
+  const labelsContainerRef = useRef(null);
+  const labelsElRef = useRef(new Map()); // track_id -> badge element, for the ID-label overlay
 
   const snapshot = useTelemetrySync();
 
@@ -379,9 +452,10 @@ export default function DroneMap() {
     let cancelled = false;
 
     // interactive:false disables every handler at once; build it disabled
-    // then enable only scroll-to-zoom and drag-to-pan. dragRotate/keyboard/
-    // boxZoom/touchZoomRotate stay off — bearing and pitch remain the chase
-    // cam's job, so a rotate gesture can't fight it mid-follow.
+    // then enable pan/zoom/rotate/pitch so the user can move the map fully
+    // freely (like Air Loom) once they've grabbed it — goManual() below is
+    // what actually stops the chase cam from fighting them, not disabling
+    // the handlers. keyboard/boxZoom stay off (not needed here).
     let map;
     try {
       map = new maplibregl.Map({
@@ -419,12 +493,23 @@ export default function DroneMap() {
     map.scrollZoom.enable();
     map.dragPan.enable();
     map.doubleClickZoom.enable();
+    map.dragRotate.enable();
+    map.touchZoomRotate.enable();
+    map.touchPitch.enable();
 
     const goManual = () => {
       if (manualRef.current) return;
       manualRef.current = true;
       setManual(true);
     };
+    // "dragstart"/"wheel"/"touchstart" are raw-input events (only fire from
+    // actual mouse/touch use), safe to trigger manual mode from directly.
+    // "rotatestart"/"pitchstart" are NOT — MapLibre also fires those from
+    // the chase cam's own jumpTo() every frame it changes bearing/pitch, so
+    // listening to them here would flip to manual mode immediately on
+    // load. "mousedown" (which fires on a right-click/ctrl-drag rotate
+    // gesture too, before "dragstart" would) covers that case instead.
+    map.on("mousedown", goManual);
     map.on("dragstart", goManual);
     map.on("wheel", goManual);
     map.on("touchstart", goManual);
@@ -440,8 +525,11 @@ export default function DroneMap() {
 
       function renderLoop() {
         rafRef.current = requestAnimationFrame(renderLoop);
-        if (!mapRef.current || !store.drone || manualRef.current) return;
-        updateCamera(store.drone, map, camRef.current, camStateRef.current);
+        if (!mapRef.current) return;
+        if (store.drone && !manualRef.current) {
+          updateCamera(store.drone, map, camRef.current, camStateRef.current);
+        }
+        syncIdLabels(map, labelsContainerRef.current, labelsElRef.current);
       }
       renderLoop();
     });
@@ -453,6 +541,8 @@ export default function DroneMap() {
       mapRef.current = null;
       camRef.current = { lng: null, lat: null, zoom: null, pitch: null, bearing: null };
       manualRef.current = false;
+      labelsElRef.current.forEach((el) => el.remove());
+      labelsElRef.current.clear();
     };
   }, []);
 
@@ -483,6 +573,9 @@ export default function DroneMap() {
         className="pointer-events-none absolute inset-0 z-[5]"
         style={{ background: "radial-gradient(ellipse at center, rgba(0,0,0,0) 66%, rgba(0,0,0,0.42) 100%)" }}
       />
+
+      {/* Track-ID badges, one per vehicle, positioned every frame via map.project() — for testing. */}
+      <div ref={labelsContainerRef} className="pointer-events-none absolute inset-0 z-[6]" />
 
       <div
         className="pointer-events-none absolute z-10 tracking-wider"

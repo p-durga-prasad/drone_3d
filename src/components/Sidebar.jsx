@@ -25,7 +25,7 @@ function AccordionGroup({ cls, items }) {
     <div className="border-b border-slate-700/50 last:border-0">
       <button
         onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center gap-2 px-3 py-2.5 text-left transition-colors hover:bg-white/[0.07]"
+        className="sticky top-0 bg-slate-900/95 z-999 cursor-pointer  flex w-full items-center gap-2 px-3 py-2.5 text-left transition-colors "
       >
         <span
           className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-xs"
@@ -52,10 +52,10 @@ function AccordionGroup({ cls, items }) {
           {items.map((o) => (
             <div
               key={o.track_id}
-              className="rounded-lg border border-slate-700/50 border-l-[3px] bg-slate-800/60 px-3 py-2 text-xs transition-colors hover:bg-slate-800"
+              className=" rounded-lg border border-slate-700/50 border-l-[3px] bg-slate-800/60 px-3 py-2 text-xs transition-colors hover:bg-slate-800"
               style={{ borderLeftColor: color }}
             >
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between ">
                 <span className="font-mono font-semibold tabular-nums text-slate-200">ID {o.track_id}</span>
               </div>
               <ConfBar value={o.confidence} />
@@ -73,6 +73,7 @@ function AccordionGroup({ cls, items }) {
 
 export default function Sidebar({ snapshot, open, onToggle }) {
   const { objects, drone } = snapshot;
+  console.log("helo",objects)
 
   const grouped = objects.reduce((acc, o) => {
     (acc[o.cls] ??= []).push(o);
@@ -80,6 +81,8 @@ export default function Sidebar({ snapshot, open, onToggle }) {
   }, {});
 
   const orderedKeys = Object.keys(CLASS_META).filter((k) => grouped[k]);
+  console.log('asdasdasd',CLASS_META)
+  console.log('grouped', grouped)
 
   return (
     <div className="relative flex shrink-0">
@@ -161,7 +164,7 @@ export default function Sidebar({ snapshot, open, onToggle }) {
           </div>
 
           {/* Footer summary */}
-          {objects.length > 0 && (
+          {/* {objects.length > 0 && (
             <div className="border-t border-slate-700/60 bg-slate-800/40 px-3 py-2">
               <div className="flex flex-wrap gap-1.5">
                 {orderedKeys.map((cls) => (
@@ -175,7 +178,7 @@ export default function Sidebar({ snapshot, open, onToggle }) {
                 ))}
               </div>
             </div>
-          )}
+          )} */}
         </div>
       </aside>
     </div>
