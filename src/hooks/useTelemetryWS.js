@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 import { store, applyFrame } from "../store/telemetryStore";
 
-const WS_URL = "ws://192.168.123.251:8055/ws/telemetry";
+const WS_URL =  import.meta.env.VITE_PATH;
 const RECONNECT_DELAY_MS = 3000;
 
 /**
@@ -9,13 +9,21 @@ const RECONNECT_DELAY_MS = 3000;
  * Opens the WebSocket, parses every message into the mutable store.
  * Never calls setState — zero re-renders from this hook.
  * onStatusChange(connected: boolean) is called when connection state changes.
+ *
+ * `running` is the Start/Stop/Resume control: while false, no socket is
+ * open at all (no auto-connect on mount, no reconnect loop) — flipping it
+ * true opens a fresh connection, flipping it back to false closes the
+ * current one and cancels any pending reconnect. Data already in the store
+ * is untouched either way; only App.jsx's "Start" (fresh) path clears it
+ * via resetStore(), "Resume" just flips `running` back on.
  */
-export function useTelemetryWS(onStatusChange) {
+export function useTelemetryWS(running, onStatusChange) {
   const wsRef      = useRef(null);
   const timerRef   = useRef(null);
   const mountedRef = useRef(true);
 
   useEffect(() => {
+    if (!running) return;
     mountedRef.current = true;
 
     function connect() {
@@ -61,6 +69,13 @@ export function useTelemetryWS(onStatusChange) {
       clearTimeout(timerRef.current);
       wsRef.current?.close();
       wsRef.current = null;
+      // The close() above fires its "close" event asynchronously, by which
+      // point wsRef.current is already null — onclose's own stale-socket
+      // guard would then skip updating status. Set it here instead, so
+      // Stop reflects "disconnected" immediately rather than leaving the
+      // indicator stuck on "Connected".
+      store.connected = false;
+      onStatusChange?.(false);
     };
-  }, []);
+  }, [running]);
 }

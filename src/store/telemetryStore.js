@@ -19,6 +19,17 @@ export const store = {
   frameCount: 0,
 };
 
+// Clears everything back to a blank slate. Called from the "Start" control
+// (fresh session) in App.jsx.
+export function resetStore() {
+  store.drone = null;
+  store.footprint = null;
+  store.objects.clear();
+  store.flightPath.length = 0;
+  store.lastFrameIndex = null;
+  store.frameCount = 0;
+}
+
 // Compass bearing (0=N, clockwise) from point 1 to point 2 — mirrors the
 // backend's builder.py _bearing_deg exactly, since the live WS feed doesn't
 // carry a heading field for detections and vehicles need to face the way
@@ -73,6 +84,10 @@ export function normalizeClass(raw = "unknown") {
 }
 
 export function applyFrame(raw) {
+  // Incremented up front (rather than at the end) so it's usable below as
+  // "the frame currently being processed" when stamping lastSeenFrame.
+  store.frameCount += 1;
+
   const telem = raw.telemetry ?? {};
 
   const droneLat = parseFloat(telem.latitude  ?? raw.drone_lat);
@@ -128,13 +143,14 @@ export function applyFrame(raw) {
     const id = obj.track_id ?? obj.id;
     if (id == null) return; // no stable identity — skip rather than collide under an `undefined` key
 
-    const cls = normalizeClass(obj.cls ?? obj.class ?? "unknown");
-
-    // Heading: use it if the backend sends one, else derive it from the
-    // last known fix for this track_id (same formula as builder.py), else
-    // hold the previous heading rather than snapping to 0 on a near-zero move.
+    // Class is locked to whatever this track_id was FIRST classified as —
+    // the model can flip-flop frame to frame (e.g. four_wheeler <-> three_wheeler
+    // on the same real vehicle) as confidence shifts, but a single physical
+    // vehicle doesn't actually change type mid-track, so later relabels for
+    // an already-known track_id are ignored rather than reclassifying it.
     const prev = store.objects.get(id);
-    
+    const cls = prev ? prev.cls : normalizeClass(obj.cls ?? obj.class ?? "unknown");
+
     if (prev) console.log("duplicate track_id", id);
     const rawHeading = parseFloat(obj.heading_deg ?? obj.heading);
     let heading = prev?.heading ?? 0;
@@ -152,9 +168,9 @@ export function applyFrame(raw) {
       heading,
       confidence: parseFloat(obj.confidence ?? 1),
       track_id: id,
+      lastSeenFrame: store.frameCount, // this frame actually re-detected it — used to tell "live" from "frozen" vehicles
     });
   });
 
   store.lastFrameIndex = raw.frame_index ?? null;
-  store.frameCount += 1;
 }
